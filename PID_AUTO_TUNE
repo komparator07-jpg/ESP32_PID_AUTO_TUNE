@@ -1,0 +1,513 @@
+#include <Arduino.h>
+#include <math.h>
+#include <Preferences.h>
+
+// ============================ НАСТРОЙКИ ============================
+// --- Пины ---
+#define NTC_PIN              34    // только ADC1 (GPIO 32..39), ADC2 конфликтует с WiFi
+#define HEATER_PIN           25    // управляющий вход SSR (с детектором нуля) ТЭНа
+#define HEATER_ACTIVE_HIGH   1     // 1 = включение уровнем HIGH
+#define HEATER_DRIVE_BUILTIN 1     // 1 = модуль сам управляет HEATER_PIN (по периодам сети)
+                                   // 0 = только переменная pidOutput (0..100 %), коммутация ваша
+#define MAINS_HZ             50    // частота сети (50 или 60)
+
+// --- Термистор ---
+#define NTC_R0        100000.0f    // Ом при T0
+#define NTC_T0_C      25.0f
+#define NTC_BETA      3950.0f
+#define R_FIXED       100000.0f    // резистор делителя, Ом
+#define NTC_TO_GND    1            // 1: 3V3--R_FIXED--(ADC)--NTC--GND
+                                   // 0: 3V3--NTC--(ADC)--R_FIXED--GND
+#define ADC_VCC_MV    3300.0f
+#define TEMP_OFFSET_C 0.0f         // поправка датчика, °C
+
+// --- Уставки (4 штуки, °C) ---
+const float SETPOINTS[4] = {40.0f, 50.0f, 60.0f, 70.0f};
+
+// --- Временные параметры ---
+#define PID_PERIOD_MS     200      // период расчёта ПИД
+#define TEMP_SAMPLE_MS    20       // период опроса термистора
+#define TEMP_EMA_ALPHA    0.15f    // сглаживание температуры (больше = быстрее, но шумнее)
+#define D_FILTER_N        8.0f     // фильтр дифференциальной части (Tf = Td / N)
+
+// --- ПИД по умолчанию (пока нет калибровки) ---
+const float DEF_KP = 5.0f;         // % мощности на 1 °C
+const float DEF_TI = 60.0f;        // с
+const float DEF_TD = 5.0f;         // с
+
+// --- Автокалибровка ---
+#define AT_OUT_MAX         100.0f  // максимальная мощность при автокалибровке, %
+#define AT_NOISE_BAND_C    0.3f    // гистерезис реле, °C
+#define AT_MIN_HALF_MS     3000UL  // минимальная длительность полупериода
+#define AT_HALF_TIMEOUT_MS 600000UL// если полупериод длится дольше - ошибка (10 мин)
+#define AT_BIAS_MIN        15.0f   // минимальное смещение мощности, %
+#define AT_CYCLES          6       // минимум циклов на одну уставку
+#define AT_MAX_CYCLES      12      // максимум циклов, если период не стабилизируется
+#define AT_TU_SPREAD       0.25f   // допустимый разброс периода между циклами (25 %)
+#define AT_RULE            0       // правило настройки:
+                                   // 0 = Tyreus-Luyben (спокойное, мало перерегулирования)
+                                   // 1 = Ziegler-Nichols (агрессивное)
+                                   // 2 = "небольшое перерегулирование"
+                                   // 3 = "без перерегулирования" (самое вялое)
+#define AT_KP_SCALE        1.0f    // общий множитель Kp после расчёта (подстройка жёсткости)
+
+// --- Диагностика (1 = включено, 0 = выключено) ---
+#define PID_DEBUG_PLOT     1       // temp/sp/out в Serial Plotter (Serial.begin делайте сами)
+#define PID_DEBUG_LOG      1       // текстовые сообщения автокалибровки
+// ===================================================================
+
+// ===================== ПЕРЕМЕННЫЕ ДЛЯ ВАШЕГО ПРОЕКТА =====================
+float pidTemp = 0;                 // температура воды, °C (после фильтра)
+float pidSetpoint = 0;             // текущая уставка, °C
+int   pidSpIndex = 0;              // номер текущей уставки 0..3
+float pidOutput = 0;               // выход ПИД, 0..100 %
+float pidFeedforward = 0;          // добавка к выходу в % (например, от датчика расхода)
+float pidGainScale = 1.0f;         // множитель усиления ПИД (при смене потока: поток_сейчас / поток_при_калибровке)
+bool  pidSensorOk = false;         // есть ли валидные показания датчика
+
+float pidKp[4], pidTi[4], pidTd[4], pidBias[4];   // коэффициенты по уставкам
+bool  pidCalibrated[4] = {false, false, false, false};
+
+enum PidMode { PID_OFF, PID_RUN, PID_AUTOTUNE };
+PidMode pidMode = PID_OFF;
+
+enum AtState { AT_IDLE, AT_RUNNING, AT_DONE, AT_FAILED };
+AtState atState = AT_IDLE;
+int atPos = 0;                     // номер шага автокалибровки (0..3 по возрастанию уставок)
+const char* atMessage = "idle";    // текстовый статус / причина ошибки
+// ========================================================================
+
+#if PID_DEBUG_LOG
+  #define DBG_LOG(...) Serial.printf(__VA_ARGS__)
+#else
+  #define DBG_LOG(...)
+#endif
+
+// ----------------------------- ТЕРМИСТОР -----------------------------
+static float ntcReadC(bool &ok) {
+  uint32_t sum = 0;
+  for (int i = 0; i < 8; i++) sum += analogReadMilliVolts(NTC_PIN);
+  float v = sum / 8.0f;
+  if (v < 15.0f || v > ADC_VCC_MV - 15.0f) { ok = false; return 0; }
+#if NTC_TO_GND
+  float r = R_FIXED * v / (ADC_VCC_MV - v);
+#else
+  float r = R_FIXED * (ADC_VCC_MV - v) / v;
+#endif
+  float invT = 1.0f / (NTC_T0_C + 273.15f) + logf(r / NTC_R0) / NTC_BETA;
+  ok = true;
+  return 1.0f / invT - 273.15f + TEMP_OFFSET_C;
+}
+
+static float med3(float a, float b, float c) {
+  if (a > b) { float t = a; a = b; b = t; }
+  if (b > c) { b = c; }
+  return (a > b) ? a : b;
+}
+
+static void tempUpdate() {
+  static unsigned long tTemp = 0, lastValid = 0;
+  static float buf[3], ema = 0;
+  static int idx = 0, cnt = 0;
+  unsigned long now = millis();
+  if (now - tTemp < TEMP_SAMPLE_MS) return;
+  tTemp = now;
+
+  bool ok;
+  float t = ntcReadC(ok);
+  if (!ok) {
+    if (now - lastValid > 2000) pidSensorOk = false;
+    return;
+  }
+  lastValid = now;
+  buf[idx] = t;
+  idx = (idx + 1) % 3;
+  if (cnt < 3) cnt++;
+  float m = (cnt >= 3) ? med3(buf[0], buf[1], buf[2]) : t;
+  if (!pidSensorOk) ema = m;                  // первый отсчёт или возврат датчика
+  else ema += TEMP_EMA_ALPHA * (m - ema);
+  pidTemp = ema;
+  pidSensorOk = true;
+}
+
+// ----------------- ВЫХОД НА SSR (управление по периодам сети) -----------------
+static void heaterWrite(bool on) {
+  bool lvl = on ? (HEATER_ACTIVE_HIGH) : !(HEATER_ACTIVE_HIGH);
+  digitalWrite(HEATER_PIN, lvl ? HIGH : LOW);
+}
+
+static void heaterUpdate() {
+#if HEATER_DRIVE_BUILTIN
+  static unsigned long tStep = 0;
+  static float acc = 0;                              // накопитель мощности
+  const unsigned long STEP_MS = 1000UL / MAINS_HZ;   // один период сети (20 мс при 50 Гц)
+  unsigned long now = millis();
+
+  if (now - tStep >= STEP_MS) {
+    tStep += STEP_MS;                                // шаг без накопления дрейфа
+    if (now - tStep >= STEP_MS) tStep = now;         // если loop надолго зависал - пересинхронизация
+
+    acc += constrain(pidOutput, 0.0f, 100.0f);
+    bool on = false;
+    if (acc >= 100.0f) { acc -= 100.0f; on = true; }
+    heaterWrite(on);
+  }
+#endif
+}
+
+// ------------------------------- ПИД -------------------------------
+static float iTerm = 0, dFilt = 0, lastTemp = 0;
+
+// коэффициенты для уставки i; если она не откалибрована - берутся от ближайшей откалиброванной
+static void getGains(int i, float &Kp, float &Ti, float &Td, float &bias) {
+  int g = -1;
+  if (pidCalibrated[i]) g = i;
+  else {
+    float best = 1e9f;
+    for (int k = 0; k < 4; k++)
+      if (pidCalibrated[k] && fabsf(SETPOINTS[k] - SETPOINTS[i]) < best) {
+        best = fabsf(SETPOINTS[k] - SETPOINTS[i]);
+        g = k;
+      }
+  }
+  if (g < 0) { Kp = DEF_KP; Ti = DEF_TI; Td = DEF_TD; bias = 0; return; }
+  Kp = pidKp[g]; Ti = pidTi[g]; Td = pidTd[g];
+  bias = pidCalibrated[i] ? pidBias[i] : 0;
+}
+
+static void pidReset() {
+  float Kp, Ti, Td, b;
+  getGains(pidSpIndex, Kp, Ti, Td, b);
+  iTerm = constrain(b, 0.0f, 100.0f);   // стартуем с мощностью, найденной при калибровке
+  lastTemp = pidTemp;
+  dFilt = 0;
+}
+
+static void pidCompute(float dt) {
+  float Kp, Ti, Td, b;
+  getGains(pidSpIndex, Kp, Ti, Td, b);
+  Kp *= pidGainScale;
+  if (Ti < 1.0f) Ti = 1.0f;
+
+  float e = pidSetpoint - pidTemp;
+  float P = Kp * e;
+
+  // D по измерению (без скачка при смене уставки) + фильтр
+  float Tf = fmaxf(Td / D_FILTER_N, 0.001f);
+  float a = Tf / (Tf + dt);
+  float dm = (pidTemp - lastTemp) / dt;
+  dFilt = a * dFilt + (1.0f - a) * dm;
+  lastTemp = pidTemp;
+  float D = -Kp * Td * dFilt;
+
+  // I с защитой от насыщения (не копим, пока выход упёрт и ошибка давит дальше)
+  float u = P + iTerm + D + pidFeedforward;
+  bool sat = (u > 100.0f && e > 0) || (u < 0.0f && e < 0);
+  if (!sat) iTerm += Kp / Ti * e * dt;
+  iTerm = constrain(iTerm, 0.0f, 100.0f);
+
+  u = P + iTerm + D + pidFeedforward;
+  pidOutput = constrain(u, 0.0f, 100.0f);
+}
+
+// --------------------------- АВТОКАЛИБРОВКА ---------------------------
+static int   atOrder[4], atIdx = 0, atCycles = 0, atNS = 0;
+static bool  atHeating = true;
+static float atBias, atD, atMax, atMin;
+static float atKuS[AT_MAX_CYCLES], atTuS[AT_MAX_CYCLES];
+static unsigned long atT1, atT2, atTHigh, atTLow, atPhaseStart;
+
+static void atBegin() {
+  atIdx = atOrder[atPos];
+  pidSpIndex = atIdx;
+  pidSetpoint = SETPOINTS[atIdx];
+  unsigned long now = millis();
+  atHeating = true;
+  atBias = AT_OUT_MAX * 0.5f;
+  atD = fminf(atBias, AT_OUT_MAX - atBias);
+  pidOutput = constrain(atBias + atD, 0.0f, AT_OUT_MAX);
+  atCycles = 0;
+  atNS = 0;
+  atT1 = atT2 = atPhaseStart = now;
+  atTHigh = atTLow = 0;
+  atMax = atMin = pidTemp;
+  DBG_LOG("AT: step %d/4, setpoint %.1f C\n", atPos + 1, pidSetpoint);
+}
+
+static void atFail(const char* msg) {
+  atState = AT_FAILED;
+  atMessage = msg;
+  pidMode = PID_OFF;
+  pidOutput = 0;
+  DBG_LOG("AT: FAILED - %s\n", msg);
+}
+
+static void applyRule(float Ku, float Tu, float &Kp, float &Ti, float &Td) {
+#if AT_RULE == 0
+  Kp = Ku / 2.2f;  Ti = 2.2f * Tu;  Td = Tu / 6.3f;          // Tyreus-Luyben
+#elif AT_RULE == 1
+  Kp = 0.6f * Ku;  Ti = 0.5f * Tu;  Td = 0.125f * Tu;        // Ziegler-Nichols
+#elif AT_RULE == 2
+  Kp = 0.33f * Ku; Ti = 0.5f * Tu;  Td = 0.33f * Tu;         // небольшое перерегулирование
+#else
+  Kp = 0.2f * Ku;  Ti = 0.5f * Tu;  Td = 0.33f * Tu;         // без перерегулирования
+#endif
+  Kp *= AT_KP_SCALE;
+}
+
+void pidSaveCalibration();
+
+static void atFinishStep() {
+  int n = (atNS < 3) ? atNS : 3;
+  float Ku = 0, Tu = 0;
+  for (int k = atNS - n; k < atNS; k++) { Ku += atKuS[k]; Tu += atTuS[k]; }
+  Ku /= n; Tu /= n;
+
+  float Kp, Ti, Td;
+  applyRule(Ku, Tu, Kp, Ti, Td);
+  pidKp[atIdx] = Kp; pidTi[atIdx] = Ti; pidTd[atIdx] = Td;
+  pidBias[atIdx] = atBias;
+  pidCalibrated[atIdx] = true;
+  DBG_LOG("AT: SP %.1f done: Ku=%.2f Tu=%.1fs -> Kp=%.2f Ti=%.1f Td=%.1f bias=%.1f%%\n",
+          SETPOINTS[atIdx], Ku, Tu, Kp, Ti, Td, atBias);
+
+  if (atPos < 3) {
+    atPos++;
+    atBegin();                       // следующая (более высокая) уставка
+  } else {
+    atState = AT_DONE;
+    atMessage = "done";
+    pidMode = PID_OFF;
+    pidOutput = 0;
+    pidSaveCalibration();
+    DBG_LOG("AT: ALL DONE, saved\n");
+  }
+}
+
+static void autotuneStep() {
+  unsigned long now = millis();
+  if (pidTemp > atMax) atMax = pidTemp;
+  if (pidTemp < atMin) atMin = pidTemp;
+
+  if (now - atPhaseStart > AT_HALF_TIMEOUT_MS) { atFail("timeout: temperature does not cross setpoint"); return; }
+
+  if (atHeating && pidTemp > pidSetpoint + AT_NOISE_BAND_C) {
+    if (now - atT2 > AT_MIN_HALF_MS) {
+      atHeating = false;
+      atT1 = now;
+      atTHigh = atT1 - atT2;
+      atMax = pidTemp;                                  // сброс отслеживания пика
+      pidOutput = constrain(atBias - atD, 0.0f, AT_OUT_MAX);
+      atPhaseStart = now;
+    }
+  } else if (!atHeating && pidTemp < pidSetpoint - AT_NOISE_BAND_C) {
+    if (now - atT1 > AT_MIN_HALF_MS) {
+      atHeating = true;
+      atT2 = now;
+      atTLow = atT2 - atT1;
+
+      if (atCycles > 0) {
+        float dCycle = atD;                             // амплитуда реле в этом цикле
+        float amp = (atMax - atMin) * 0.5f;             // амплитуда колебаний температуры
+        if (atCycles >= 2) {
+          if (amp < 0.05f) { atFail("oscillation amplitude too small"); return; }
+          atKuS[atNS] = 4.0f * dCycle / (PI * amp);
+          atTuS[atNS] = (atTHigh + atTLow) / 1000.0f;
+          atNS++;
+        }
+        // подбор смещения: выравниваем время нагрева и паузы
+        atBias += atD * ((float)atTHigh - (float)atTLow) / (float)(atTHigh + atTLow);
+        atBias = constrain(atBias, AT_BIAS_MIN, AT_OUT_MAX - AT_BIAS_MIN);
+        atD = fminf(atBias, AT_OUT_MAX - atBias);
+      }
+      pidOutput = constrain(atBias + atD, 0.0f, AT_OUT_MAX);
+      atCycles++;
+      atMin = pidTemp;                                  // сброс отслеживания впадины
+      atPhaseStart = now;
+      DBG_LOG("AT: cycle %d  high=%lums low=%lums bias=%.1f%%\n", atCycles, atTHigh, atTLow, atBias);
+
+      if (atCycles >= AT_CYCLES && atNS >= 3) {
+        int n = 3;
+        float Tsum = 0, Tmn = 1e9f, Tmx = 0;
+        for (int k = atNS - n; k < atNS; k++) {
+          Tsum += atTuS[k];
+          if (atTuS[k] < Tmn) Tmn = atTuS[k];
+          if (atTuS[k] > Tmx) Tmx = atTuS[k];
+        }
+        float spread = (Tmx - Tmn) / (Tsum / n);
+        if (spread <= AT_TU_SPREAD || atCycles >= AT_MAX_CYCLES) atFinishStep();
+      }
+    }
+  }
+}
+
+// --------------------------- СОХРАНЕНИЕ В NVS ---------------------------
+struct PidCalData {
+  uint32_t magic;
+  float sp[4], kp[4], ti[4], td[4], bias[4];
+  uint8_t ok[4];
+};
+#define PID_CAL_MAGIC 0xA5C30001UL
+
+void pidSaveCalibration() {
+  PidCalData c;
+  c.magic = PID_CAL_MAGIC;
+  for (int i = 0; i < 4; i++) {
+    c.sp[i] = SETPOINTS[i]; c.kp[i] = pidKp[i]; c.ti[i] = pidTi[i];
+    c.td[i] = pidTd[i]; c.bias[i] = pidBias[i]; c.ok[i] = pidCalibrated[i];
+  }
+  Preferences prefs;
+  prefs.begin("pidcal", false);
+  prefs.putBytes("cal", &c, sizeof(c));
+  prefs.end();
+}
+
+// возвращает true, если загружена хотя бы одна уставка
+// (если значения SETPOINTS в коде изменились, калибровка для них отбрасывается)
+bool pidLoadCalibration() {
+  PidCalData c;
+  Preferences prefs;
+  prefs.begin("pidcal", false);
+  size_t n = prefs.getBytes("cal", &c, sizeof(c));
+  prefs.end();
+  if (n != sizeof(c) || c.magic != PID_CAL_MAGIC) return false;
+  bool any = false;
+  for (int i = 0; i < 4; i++) {
+    if (c.ok[i] && fabsf(c.sp[i] - SETPOINTS[i]) < 0.01f) {
+      pidKp[i] = c.kp[i]; pidTi[i] = c.ti[i]; pidTd[i] = c.td[i];
+      pidBias[i] = c.bias[i]; pidCalibrated[i] = true;
+      any = true;
+    }
+  }
+  return any;
+}
+
+void pidClearCalibration() {
+  for (int i = 0; i < 4; i++) pidCalibrated[i] = false;
+  Preferences prefs;
+  prefs.begin("pidcal", false);
+  prefs.clear();
+  prefs.end();
+}
+
+// ============== DEBUG: SERIAL PLOTTER (НАЧАЛО БЛОКА) ==============
+#if PID_DEBUG_PLOT
+static void debugPlotUpdate() {
+  Serial.print("temp:");  Serial.print(pidTemp, 2);
+  Serial.print(",sp:");   Serial.print(pidSetpoint, 1);
+  Serial.print(",out:");  Serial.println(pidOutput, 0);
+}
+#endif
+// ============== DEBUG: SERIAL PLOTTER (КОНЕЦ БЛОКА) ===============
+
+// =============================== API ===============================
+void pidInit() {
+  pinMode(HEATER_PIN, OUTPUT);
+  heaterWrite(false);
+  analogReadResolution(12);
+  analogSetPinAttenuation(NTC_PIN, ADC_11db);
+
+  for (int i = 0; i < 20; i++) { tempUpdate(); delay(TEMP_SAMPLE_MS + 2); }   // прогрев фильтра
+
+  pidMode = PID_OFF;
+  pidSpIndex = 0;
+  pidSetpoint = SETPOINTS[0];
+  pidOutput = 0;
+}
+
+// выбрать уставку 0..3 (во время автокалибровки игнорируется)
+void pidSelectSetpoint(int i) {
+  if (i < 0 || i > 3 || pidMode == PID_AUTOTUNE) return;
+  pidSpIndex = i;
+  pidSetpoint = SETPOINTS[i];
+  pidReset();
+}
+
+void pidStart() {
+  if (pidMode == PID_AUTOTUNE) return;
+  pidReset();
+  pidMode = PID_RUN;
+}
+
+void pidStop() {
+  if (pidMode == PID_AUTOTUNE) return;
+  pidMode = PID_OFF;
+  pidOutput = 0;
+}
+
+void pidAutotuneStart() {
+  for (int i = 0; i < 4; i++) atOrder[i] = i;
+  for (int i = 1; i < 4; i++) {                       // сортировка уставок по возрастанию
+    int key = atOrder[i], j = i - 1;
+    while (j >= 0 && SETPOINTS[atOrder[j]] > SETPOINTS[key]) { atOrder[j + 1] = atOrder[j]; j--; }
+    atOrder[j + 1] = key;
+  }
+  atPos = 0;
+  atState = AT_RUNNING;
+  atMessage = "running";
+  pidMode = PID_AUTOTUNE;
+  atBegin();
+}
+
+void pidAutotuneAbort() {
+  if (pidMode != PID_AUTOTUNE) return;
+  pidMode = PID_OFF;
+  pidOutput = 0;
+  atState = AT_IDLE;
+  atMessage = "aborted";
+}
+
+bool pidIsCalibrated(int i) { return (i >= 0 && i < 4) && pidCalibrated[i]; }
+
+// вызывать в loop() как можно чаще, без delay()
+void pidUpdate() {
+  static unsigned long tPid = 0;
+  tempUpdate();
+
+  unsigned long now = millis();
+  if (now - tPid >= PID_PERIOD_MS) {
+    float dt = (now - tPid) / 1000.0f;
+    if (dt > 1.0f) dt = PID_PERIOD_MS / 1000.0f;      // первый вызов / большая пауза
+    tPid = now;
+
+    if (!pidSensorOk) pidOutput = 0;
+    else if (pidMode == PID_RUN) pidCompute(dt);
+    else if (pidMode == PID_AUTOTUNE) autotuneStep();
+    else pidOutput = 0;
+
+#if PID_DEBUG_PLOT
+    debugPlotUpdate();
+#endif
+  }
+  heaterUpdate();
+}
+
+// ============================== ПРИМЕР ==============================
+void setup() {
+  Serial.begin(115200);
+  pidInit();
+  if (!pidLoadCalibration()) Serial.println("Калибровки нет: отправьте 'a' для автокалибровки");
+}
+
+void loop() {
+  pidUpdate();
+
+  // Команды из монитора порта (замените на кнопки/меню проекта):
+  // 1..4 - выбрать уставку, g - старт ПИД, s - стоп, a - автокалибровка, x - прервать
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (c >= '1' && c <= '4') pidSelectSetpoint(c - '1');
+    else if (c == 'g') pidStart();
+    else if (c == 's') pidStop();
+    else if (c == 'a') pidAutotuneStart();
+    else if (c == 'x') pidAutotuneAbort();
+  }
+
+  // Сообщение о завершении автокалибровки (один раз)
+  static AtState lastAt = AT_IDLE;
+  if (atState != lastAt) {
+    lastAt = atState;
+    if (atState == AT_DONE)   Serial.println("Автокалибровка завершена");
+    if (atState == AT_FAILED) Serial.println(atMessage);
+  }
+}
